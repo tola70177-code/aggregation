@@ -1,0 +1,176 @@
+databaseChangeLog:
+
+  # ── source_channels ──────────────────────────────────────────────────
+  - changeSet:
+      id: 1
+      author: botaggregation
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - tableExists:
+                tableName: source_channels
+      changes:
+        - createTable:
+            tableName: source_channels
+            columns:
+              - column:
+                  name: id
+                  type: BIGSERIAL
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: channel_id
+                  type: BIGINT
+                  constraints:
+                    nullable: false
+              - column:
+                  name: channel_name
+                  type: VARCHAR(255)
+              - column:
+                  name: enabled
+                  type: BOOLEAN
+                  defaultValueBoolean: true
+                  constraints:
+                    nullable: false
+
+  # ── destination_channel ──────────────────────────────────────────────
+  - changeSet:
+      id: 2
+      author: botaggregation
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - tableExists:
+                tableName: destination_channel
+      changes:
+        - createTable:
+            tableName: destination_channel
+            columns:
+              - column:
+                  name: id
+                  type: BIGSERIAL
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: channel_id
+                  type: BIGINT
+                  constraints:
+                    nullable: false
+
+  # ── processed_posts ──────────────────────────────────────────────────
+  - changeSet:
+      id: 3
+      author: botaggregation
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - tableExists:
+                tableName: processed_posts
+      changes:
+        - createTable:
+            tableName: processed_posts
+            columns:
+              - column:
+                  name: id
+                  type: BIGSERIAL
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: source_chat_id
+                  type: BIGINT
+                  constraints:
+                    nullable: false
+              - column:
+                  name: source_message_id
+                  type: BIGINT
+                  constraints:
+                    nullable: false
+              - column:
+                  name: processed_at
+                  type: TIMESTAMP
+                  defaultValueComputed: NOW()
+                  constraints:
+                    nullable: false
+        - addUniqueConstraint:
+            tableName: processed_posts
+            columnNames: source_chat_id, source_message_id
+            constraintName: uq_processed_posts_chat_message
+
+  # ── telegram_account ─────────────────────────────────────────────────
+  - changeSet:
+      id: 4
+      author: botaggregation
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - tableExists:
+                tableName: telegram_account
+      changes:
+        - createTable:
+            tableName: telegram_account
+            columns:
+              - column:
+                  name: id
+                  type: BIGSERIAL
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: phone_number
+                  type: VARCHAR(50)
+                  constraints:
+                    nullable: false
+              - column:
+                  name: active
+                  type: BOOLEAN
+                  defaultValueBoolean: true
+                  constraints:
+                    nullable: false
+
+  # ── post_template ──────────────────────────────────────────────────
+  - changeSet:
+      id: 5
+      author: botaggregation
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - tableExists:
+                tableName: post_template
+      changes:
+        - createTable:
+            tableName: post_template
+            columns:
+              - column:
+                  name: id
+                  type: BIGSERIAL
+                  constraints:
+                    primaryKey: true
+              - column:
+                  name: template_text
+                  type: TEXT
+              - column:
+                  name: result_text
+                  type: TEXT
+
+  # ── post_template: add HTML template fields ────────────────────────
+  - changeSet:
+      id: 6
+      author: botaggregation
+      preConditions:
+        - onFail: MARK_RAN
+        - not:
+            - columnExists:
+                tableName: post_template
+                columnName: result_html
+      changes:
+        - addColumn:
+            tableName: post_template
+            columns:
+              - column:
+                  name: result_html
+                  type: TEXT
+              - column:
+                  name: field_names
+                  type: TEXT
+              - column:
+                  name: field_examples
+                  type: TEXT

@@ -1,0 +1,75 @@
+spring:
+  application:
+    name: bot-aggregation
+  main:
+    banner-mode: "off"
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/bot_aggregation}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${HIKARI_MAX_POOL:10}
+      minimum-idle: ${HIKARI_MIN_IDLE:2}
+      connection-timeout: 10000
+      idle-timeout: 300000
+      max-lifetime: 600000
+
+  threads:
+    virtual:
+      enabled: true
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  liquibase:
+    change-log: classpath:db/changelog/db.changelog.yaml
+
+tdlib:
+  api-id: ${TDLIB_API_ID}
+  api-hash: ${TDLIB_API_HASH}
+  database-directory: ${TDLIB_DATABASE_DIR:./tdlib-data}
+  files-directory: ${TDLIB_FILES_DIR:./tdlib-files}
+  system-language: ${TDLIB_SYSTEM_LANGUAGE:en}
+  device-model: ${TDLIB_DEVICE_MODEL:Server}
+  application-version: ${TDLIB_APP_VERSION:1.0.0}
+
+openai:
+  api-key: ${OPENAI_API_KEY}
+  model: ${OPENAI_MODEL:gpt-4o-mini}
+  api-url: ${OPENAI_API_URL:https://api.openai.com/v1/chat/completions}
+
+telegram:
+  bot:
+    token: ${TELEGRAM_BOT_TOKEN}
+
+server:
+  port: ${PORT:8080}
+  forward-headers-strategy: framework
+
+logging:
+  level:
+    org.hibernate.Version: "OFF"
+    com.github.botaggregation: "INFO"
+    org.apache.catalina.core.StandardService: "OFF"
+    org.apache.catalina.core.StandardEngine: "OFF"
+    org.springframework.boot.web.embedded.tomcat.TomcatWebServer: "OFF"
+    org.springframework.boot.actuate.endpoint.web.EndpointLinksResolver: "OFF"
+
+management:
+  server:
+    port: ${MANAGEMENT_PORT:9090}
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
