@@ -1,13 +1,13 @@
 package com.github.botaggregation.repository;
 
-import com.github.botaggregation.entity.PostTemplate;
+import com.github.botaggregation.entity.UserTemplate;
 import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.util.Optional;
 
-public interface PostTemplateRepository extends JpaRepository<PostTemplate, Long> {
+public interface UserTemplateRepository extends JpaRepository<UserTemplate, Long> {
 
-    default Optional<PostTemplate> findCurrent() {
+    default Optional<UserTemplate> findCurrent() {
         return findAll().stream().findFirst();
     }
 }

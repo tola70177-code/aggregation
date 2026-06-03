@@ -3,12 +3,7 @@ databaseChangeLog:
   # ── source_channels ──────────────────────────────────────────────────
   - changeSet:
       id: 1
-      author: botaggregation
-      preConditions:
-        - onFail: MARK_RAN
-        - not:
-            - tableExists:
-                tableName: source_channels
+      author: iohans
       changes:
         - createTable:
             tableName: source_channels
@@ -36,12 +31,7 @@ databaseChangeLog:
   # ── destination_channel ──────────────────────────────────────────────
   - changeSet:
       id: 2
-      author: botaggregation
-      preConditions:
-        - onFail: MARK_RAN
-        - not:
-            - tableExists:
-                tableName: destination_channel
+      author: iohans
       changes:
         - createTable:
             tableName: destination_channel
@@ -60,12 +50,7 @@ databaseChangeLog:
   # ── processed_posts ──────────────────────────────────────────────────
   - changeSet:
       id: 3
-      author: botaggregation
-      preConditions:
-        - onFail: MARK_RAN
-        - not:
-            - tableExists:
-                tableName: processed_posts
+      author: iohans
       changes:
         - createTable:
             tableName: processed_posts
@@ -76,68 +61,31 @@ databaseChangeLog:
                   constraints:
                     primaryKey: true
               - column:
-                  name: source_chat_id
+                  name: source_channel_id
                   type: BIGINT
+                  defaultValueNumeric: 0
                   constraints:
                     nullable: false
               - column:
-                  name: source_message_id
-                  type: BIGINT
-                  constraints:
-                    nullable: false
+                  name: content_link
+                  type: VARCHAR(2048)
               - column:
-                  name: processed_at
-                  type: TIMESTAMP
-                  defaultValueComputed: NOW()
-                  constraints:
-                    nullable: false
-        - addUniqueConstraint:
+                  name: content_fields
+                  type: TEXT
+        - createIndex:
             tableName: processed_posts
-            columnNames: source_chat_id, source_message_id
-            constraintName: uq_processed_posts_chat_message
+            indexName: idx_processed_posts_content_link
+            columns:
+              - column:
+                  name: content_link
 
-  # ── telegram_account ─────────────────────────────────────────────────
+  # ── user_template ────────────────────────────────────────────────────
   - changeSet:
       id: 4
-      author: botaggregation
-      preConditions:
-        - onFail: MARK_RAN
-        - not:
-            - tableExists:
-                tableName: telegram_account
+      author: iohans
       changes:
         - createTable:
-            tableName: telegram_account
-            columns:
-              - column:
-                  name: id
-                  type: BIGSERIAL
-                  constraints:
-                    primaryKey: true
-              - column:
-                  name: phone_number
-                  type: VARCHAR(50)
-                  constraints:
-                    nullable: false
-              - column:
-                  name: active
-                  type: BOOLEAN
-                  defaultValueBoolean: true
-                  constraints:
-                    nullable: false
-
-  # ── post_template ──────────────────────────────────────────────────
-  - changeSet:
-      id: 5
-      author: botaggregation
-      preConditions:
-        - onFail: MARK_RAN
-        - not:
-            - tableExists:
-                tableName: post_template
-      changes:
-        - createTable:
-            tableName: post_template
+            tableName: user_template
             columns:
               - column:
                   name: id
@@ -147,30 +95,16 @@ databaseChangeLog:
               - column:
                   name: template_text
                   type: TEXT
+                  constraints:
+                    nullable: false
               - column:
-                  name: result_text
+                  name: fields
                   type: TEXT
-
-  # ── post_template: add HTML template fields ────────────────────────
-  - changeSet:
-      id: 6
-      author: botaggregation
-      preConditions:
-        - onFail: MARK_RAN
-        - not:
-            - columnExists:
-                tableName: post_template
-                columnName: result_html
-      changes:
-        - addColumn:
-            tableName: post_template
-            columns:
+                  constraints:
+                    nullable: false
               - column:
-                  name: result_html
-                  type: TEXT
-              - column:
-                  name: field_names
-                  type: TEXT
-              - column:
-                  name: field_examples
-                  type: TEXT
+                  name: has_image
+                  type: BOOLEAN
+                  defaultValueBoolean: true
+                  constraints:
+                    nullable: false

@@ -2,7 +2,6 @@ package com.github.botaggregation.service;
 
 import com.github.botaggregation.config.TdLibProperties;
 import com.github.botaggregation.repository.SourceChannelRepository;
-import com.github.botaggregation.repository.TelegramAccountRepository;
 import it.tdlight.Init;
 import it.tdlight.client.APIToken;
 import it.tdlight.client.AuthenticationSupplier;
@@ -35,7 +34,6 @@ import java.util.concurrent.TimeUnit;
 public class TdLibClientService {
 
     private final TdLibProperties tdLibProperties;
-    private final TelegramAccountRepository telegramAccountRepository;
     private final SourceChannelRepository sourceChannelRepository;
     private final MessageProcessingService messageProcessingService;
 
@@ -55,22 +53,11 @@ public class TdLibClientService {
     @PostConstruct
     public void init() {
         loadMonitoredChannels();
-
-        var account = telegramAccountRepository.findFirstByActiveTrue();
-        if (account.isEmpty()) {
-            log.info("[TDLIB] No active Telegram account configured. Set one via PUT /api/account");
-            return;
-        }
-
-        String phoneNumber = account.get().getPhoneNumber();
-        log.info("[TDLIB] Starting TDLib client for phone: {}****",
-                phoneNumber.substring(0, Math.min(4, phoneNumber.length())));
-
-        Thread.startVirtualThread(() -> startClient(phoneNumber));
+        log.info("[TDLIB] Initialized. Waiting for phone number via bot.");
     }
 
     public void startWithPhone(String phoneNumber) {
-        shutdown();
+        logOutAndShutdown();
 
         authState = AuthState.WAITING;
         authError = null;
@@ -83,9 +70,56 @@ public class TdLibClientService {
         Thread.startVirtualThread(() -> startClient(phoneNumber));
     }
 
+    /**
+     * Logs out the current TDLib session (terminates the session on Telegram servers)
+     * and shuts down the client. Also deletes local session data so a fresh login
+     * is required for the next account.
+     */
+    public void logOutAndShutdown() {
+        try {
+            if (client != null && authState == AuthState.READY) {
+                log.info("[TDLIB] Logging out current session...");
+                client.send(new TdApi.LogOut()).get(15, TimeUnit.SECONDS);
+                log.info("[TDLIB] Logged out successfully");
+            }
+        } catch (Exception e) {
+            log.warn("[TDLIB] LogOut failed (will force shutdown): {}", e.getMessage());
+        }
+
+        shutdown();
+        deleteSessionData();
+    }
+
+    private void deleteSessionData() {
+        try {
+            var dbDir = Path.of(tdLibProperties.getDatabaseDirectory()).toFile();
+            if (dbDir.exists()) {
+                deleteRecursive(dbDir);
+                log.info("[TDLIB] Deleted session data: {}", dbDir.getAbsolutePath());
+            }
+        } catch (Exception e) {
+            log.warn("[TDLIB] Failed to delete session data: {}", e.getMessage());
+        }
+    }
+
+    private void deleteRecursive(java.io.File file) {
+        if (file.isDirectory()) {
+            var children = file.listFiles();
+            if (children != null) {
+                for (var child : children) {
+                    deleteRecursive(child);
+                }
+            }
+        }
+        file.delete();
+    }
+
     private void startClient(String phoneNumber) {
         try {
             Init.init();
+
+            // Reduce TDLib internal logging to errors only (avoids flooding Railway logs)
+            it.tdlight.Log.setVerbosityLevel(1);
 
             var apiToken = new APIToken(tdLibProperties.getApiId(), tdLibProperties.getApiHash());
             var settings = TDLibSettings.create(apiToken);
@@ -174,6 +208,8 @@ public class TdLibClientService {
         long chatId = message.chatId;
 
         if (!monitoredChannelIds.contains(chatId)) {
+
+            log.info("[TDLIB] Ignoring message from unmonitored chat {} (monitoring: {})", chatId, monitoredChannelIds);
             return;
         }
 
@@ -183,13 +219,13 @@ public class TdLibClientService {
             boolean isFirst = !albumBuffer.containsKey(albumId);
             albumBuffer.computeIfAbsent(albumId, k -> Collections.synchronizedList(new ArrayList<>()))
                     .add(message);
-            log.debug("[TDLIB] Buffered album message {}/{} (albumId={})", chatId, message.id, albumId);
+            log.info("[TDLIB] Buffered album message {}/{} (albumId={})", chatId, message.id, albumId);
 
             if (isFirst) {
                 Thread.startVirtualThread(() -> processAlbumAfterDelay(albumId));
             }
         } else {
-            log.debug("[TDLIB] New message from monitored channel {}: msgId={}", chatId, message.id);
+            log.info("[TDLIB] New message from monitored channel {}: msgId={}", chatId, message.id);
             Thread.startVirtualThread(() -> {
                 try {
                     messageProcessingService.process(message, this);
@@ -252,34 +288,6 @@ public class TdLibClientService {
             log.error("[TDLIB] Failed to get subscribed channels: {}", e.getMessage(), e);
             return List.of();
         }
-    }
-
-    public TdApi.ChatInviteLinkInfo checkChatInviteLink(String inviteLink) {
-        if (client == null || authState != AuthState.READY) return null;
-        try {
-            var result = client.send(new TdApi.CheckChatInviteLink(inviteLink))
-                    .get(10, TimeUnit.SECONDS);
-            if (result instanceof TdApi.ChatInviteLinkInfo info) {
-                return info;
-            }
-        } catch (Exception e) {
-            log.error("[TDLIB] Failed to check invite link: {}", e.getMessage());
-        }
-        return null;
-    }
-
-    public TdApi.Chat searchPublicChat(String username) {
-        if (client == null || authState != AuthState.READY) return null;
-        try {
-            var result = client.send(new TdApi.SearchPublicChat(username))
-                    .get(10, TimeUnit.SECONDS);
-            if (result instanceof TdApi.Chat chat) {
-                return chat;
-            }
-        } catch (Exception e) {
-            log.error("[TDLIB] Failed to search public chat: {}", e.getMessage());
-        }
-        return null;
     }
 
     public TdApi.File downloadFileSync(int fileId) {

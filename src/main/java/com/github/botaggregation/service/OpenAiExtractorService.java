@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.botaggregation.config.OpenAiProperties;
-import com.github.botaggregation.dto.ExtractedProduct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpEntity;
@@ -13,7 +12,6 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -26,83 +24,107 @@ public class OpenAiExtractorService {
     private final OpenAiProperties properties;
     private final ObjectMapper objectMapper;
 
+    public record TemplateAnalysis(List<String> fields, Map<String, String> examples) {}
+
     /**
-     * One-time setup: analyze template + user instruction.
-     * Returns JSON with two keys:
-     *   "fields" → {label: templateLineNumber}
-     *   "output_template" → HTML string with {{label}} placeholders
+     * Analyzes a user-provided template to identify field names and their example values.
+     * Returns field names and their corresponding values found in the template text,
+     * so the caller can do the replacement on the original HTML.
+     *
+     * @param templateText the user's template text (may contain HTML)
+     * @return TemplateAnalysis with field names and example values, or null on error
      */
-    public JsonNode analyzeInstruction(String templateText, String instruction) {
+    public TemplateAnalysis analyzeTemplate(String templateText) {
         try {
-            String numbered = numberLines(templateText);
+            String systemPrompt = "You are a template analyzer.\n"
+                    + "The user sends a sample post. Your task is to identify all data fields "
+                    + "(e.g. product name, price, link, discount, etc.) and extract their exact values "
+                    + "as they appear in the text.\n\n"
+                    + "CRITICAL RULES:\n"
+                    + "- Assign each field a short snake_case name\n"
+                    + "- Extract the COMPLETE value for each field exactly as it appears in the text\n"
+                    + "- The product/item name is ALWAYS a single field — never split it\n"
+                    + "- Prices with currency symbols are single fields (e.g. '302 ₴ / $6.81' is one value)\n"
+                    + "- Ignore any HTML tags when identifying values, but return the plain text value "
+                    + "WITHOUT HTML tags\n"
+                    + "- URLs are single fields\n"
+                    + "- IMPORTANT: Telegram links (t.me/*, telegram.me/*) are NOT data fields. "
+                    + "They are static parts of the template and must be completely ignored. "
+                    + "Do NOT include them in fields or examples.\n\n"
+                    + "Return JSON with exactly these fields:\n"
+                    + "- fields: array of field name strings\n"
+                    + "- examples: object mapping each field name to its exact value from the text\n\n"
+                    + "Return ONLY the JSON object. No comments, no explanation.";
 
-            String systemPrompt = "You are given a numbered template post and a user instruction.\n"
-                    + "The instruction says what to keep from the template and what to change.\n\n"
-                    + "Return a JSON object with exactly 2 keys:\n"
-                    + "1. \"fields\" — object where keys are snake_case labels and values are the template line numbers containing that data.\n"
-                    + "2. \"output_template\" — the desired output as a string "
-                    + "with {{label}} placeholders matching the field names.\n\n"
-                    + "IMPORTANT: Do NOT wrap {{placeholder}} tokens in any formatting tags "
-                    + "like <b>, <i>, <code>, <u>, <s>, etc. "
-                    + "The source post's formatting is preserved automatically. "
-                    + "Only use HTML tags (<b>, <i>, <a href=\"\">) for STATIC text that you add yourself "
-                    + "(labels, emoji descriptions, link text like 'Buy here').\n"
-                    + "For URLs use: <a href=\\\"{{url_field}}\\\">link text</a>\n\n"
-                    + "Example response:\n"
-                    + "{\"fields\":{\"product_name\":1,\"price\":2,\"url\":3},"
-                    + "\"output_template\":\"{{product_name}}\\n💰 {{price}}\\n🔗 <a href=\\\"{{url}}\\\">Buy</a>\"}\n\n"
-                    + "Return ONLY valid JSON. Do NOT wrap in array.";
-
-            String userMessage = "=== TEMPLATE ===\n" + numbered
-                    + "\n\n=== INSTRUCTION ===\n" + instruction;
+            String userMessage = "POST:\n" + templateText;
 
             String content = callOpenAi(systemPrompt, userMessage);
+            JsonNode json = objectMapper.readTree(content);
 
-            JsonNode parsed = objectMapper.readTree(content);
-            if (parsed.isArray() && !parsed.isEmpty()) {
-                parsed = parsed.get(0);
+            List<String> fields = objectMapper.convertValue(
+                    json.path("fields"), new TypeReference<List<String>>() {});
+            Map<String, String> examples = objectMapper.convertValue(
+                    json.path("examples"), new TypeReference<Map<String, String>>() {});
+
+            if (fields == null || fields.isEmpty() || examples == null || examples.isEmpty()) {
+                log.warn("[OPENAI] analyzeTemplate returned empty fields or examples");
+                return null;
             }
-            return parsed;
+
+            return new TemplateAnalysis(fields, examples);
         } catch (Exception e) {
-            log.error("[OPENAI] Instruction analysis failed: {}", e.getMessage());
+            log.error("[OPENAI] analyzeTemplate failed: {}", e.getMessage());
             return null;
         }
     }
 
     /**
-     * Per-message: extract fields from post. Short prompt — just field names + line numbers.
-     * fieldLines = "product_name (line 1), price (line 3), url (line 5)"
+     * Extracts field values from a post text given a list of required field names.
+     *
+     * @param postText   the post text (plain text with URLs)
+     * @param fieldNames the list of field names to extract
+     * @return map of field name to extracted value, or null on error
      */
-    public Map<String, String> extractFromPost(String postText, String fieldLines) {
+    public Map<String, String> extractFields(String postText, List<String> fieldNames) {
         try {
-            String systemPrompt = "Extract from post: " + fieldLines + ". "
-                    + "Return flat JSON. Capture full content of each field.";
+            String systemPrompt = "You are a data extractor for Telegram posts.\n"
+                    + "Extract the following fields from the post text.\n"
+                    + "Return a JSON object with exactly these keys: " + String.join(", ", fieldNames) + "\n"
+                    + "Set the value to null if a field is not found in the post.\n"
+                    + "CRITICAL: Extract values EXACTLY as they appear in the post text. "
+                    + "Preserve ALL characters including currency symbols (₴, $, €, £, ¥), "
+                    + "special characters, emoji, units, and formatting. "
+                    + "Do NOT strip, modify, or clean any characters from the extracted values. "
+                    + "For example, '302 ₴ / $6.81' must be returned as '302 ₴ / $6.81', not '302 / 6.81'.\n"
+                    + "IMPORTANT: All URLs must be returned clean, without any tracking or affiliate parameters. "
+                    + "Remove these query parameters: utm_source, utm_medium, utm_campaign, utm_term, utm_content, "
+                    + "ref, tag, fbclid, gclid, sclid, dclid, msclkid, mc_cid, mc_eid, yclid, _ga, _gl, "
+                    + "affiliate_id, aff_id, partner, click_id. "
+                    + "If removing parameters leaves an empty query string, remove the '?' as well.\n"
+                    + "Return ONLY the JSON object. No comments, no explanation.";
 
-            String content = callOpenAi(systemPrompt, postText);
+            String userMessage = "POST:\n" + postText;
 
-            JsonNode parsed = objectMapper.readTree(content);
-            if (parsed.isArray() && !parsed.isEmpty()) {
-                parsed = parsed.get(0);
-            }
+            String content = callOpenAi(systemPrompt, userMessage);
+            Map<String, String> result = objectMapper.readValue(content, new TypeReference<>() {});
 
-            return objectMapper.convertValue(parsed,
-                    new TypeReference<LinkedHashMap<String, String>>() {});
+            return result;
         } catch (Exception e) {
-            log.error("[OPENAI] Post extraction failed: {}", e.getMessage());
-            return Map.of();
+            log.error("[OPENAI] extractFields failed: {}", e.getMessage());
+            return null;
         }
     }
 
-    private String callOpenAi(String systemPrompt, String userMessage) throws Exception {
+    String callOpenAi(String systemPrompt, String userMessage) throws Exception {
         var headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         headers.setBearerAuth(properties.getApiKey());
 
-        var body = Map.of(
+        var body = java.util.Map.of(
                 "model", properties.getModel(),
                 "messages", List.of(
-                        Map.of("role", "system", "content", systemPrompt),
-                        Map.of("role", "user", "content", userMessage)
+                        java.util.Map.of("role", "system", "content", systemPrompt),
+                        java.util.Map.of("role", "user", "content", userMessage)
                 ),
                 "temperature", 0.1
         );
@@ -119,29 +141,5 @@ public class OpenAiExtractorService {
         }
 
         return content;
-    }
-
-    private String numberLines(String text) {
-        String[] lines = text.split("\n", -1);
-        var sb = new StringBuilder();
-        for (int i = 0; i < lines.length; i++) {
-            if (i > 0) sb.append("\n");
-            sb.append(i + 1).append(": ").append(lines[i]);
-        }
-        return sb.toString();
-    }
-
-    // --- legacy ---
-
-    public ExtractedProduct extract(String messageText) {
-        try {
-            String content = callOpenAi(
-                    "Extract product info. Return JSON: {\"title\":\"\",\"price\":\"\",\"url\":\"\"}",
-                    messageText);
-            return objectMapper.readValue(content, ExtractedProduct.class);
-        } catch (Exception e) {
-            log.error("[OPENAI] Extraction failed: {}", e.getMessage());
-            return new ExtractedProduct();
-        }
     }
 }

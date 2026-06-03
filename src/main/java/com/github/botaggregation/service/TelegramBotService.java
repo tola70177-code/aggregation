@@ -1,21 +1,24 @@
 package com.github.botaggregation.service;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.botaggregation.config.TelegramBotProperties;
 import com.github.botaggregation.entity.DestinationChannel;
-import com.github.botaggregation.entity.PostTemplate;
 import com.github.botaggregation.entity.SourceChannel;
+import com.github.botaggregation.entity.UserTemplate;
 import com.github.botaggregation.repository.DestinationChannelRepository;
-import com.github.botaggregation.repository.PostTemplateRepository;
 import com.github.botaggregation.repository.SourceChannelRepository;
+import com.github.botaggregation.repository.UserTemplateRepository;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+import org.telegram.telegrambots.meta.api.methods.description.SetMyDescription;
+import org.telegram.telegrambots.meta.api.methods.description.SetMyShortDescription;
 import org.telegram.telegrambots.longpolling.interfaces.LongPollingUpdateConsumer;
 import org.telegram.telegrambots.longpolling.starter.SpringLongPollingBot;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.DeleteMessage;
+import org.telegram.telegrambots.meta.api.methods.updatingmessages.EditMessageText;
 import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
@@ -24,13 +27,13 @@ import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKe
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardRow;
 import org.telegram.telegrambots.meta.generics.TelegramClient;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Component
@@ -38,37 +41,68 @@ import java.util.stream.Collectors;
 public class TelegramBotService implements SpringLongPollingBot, LongPollingSingleThreadUpdateConsumer {
 
     private static final int PAGE_SIZE = 8;
-    private static final Pattern INVITE_LINK = Pattern.compile(
-            "https?://t\\.me/(\\+[A-Za-z0-9_-]+|joinchat/[A-Za-z0-9_-]+)");
-    private static final Pattern PUBLIC_LINK = Pattern.compile(
-            "https?://t\\.me/([A-Za-z]\\w{3,})");
+
+    private static final String MENU_DESCRIPTION = """
+            Джерело постів — звідки беремо пости
+            Канал для постів — куди відправляємо пости по шаблону
+            Шаблон — на прикладі одного поста, вказуємо яку інформацію хочемо залишити і в якому форматі, після створення шаблону, відправляємо його в бота
+            Вийти з акаунта — завершує роботу з ботом""";
 
     private final TelegramClient telegramClient;
     private final TelegramBotProperties botProperties;
     private final TdLibClientService tdLibClientService;
     private final SourceChannelRepository sourceChannelRepository;
     private final DestinationChannelRepository destinationChannelRepository;
-    private final PostTemplateRepository postTemplateRepository;
+    private final UserTemplateRepository userTemplateRepository;
     private final OpenAiExtractorService openAiExtractorService;
-    private final ObjectMapper objectMapper;
     private final ConcurrentHashMap<String, String> pendingAction = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> lastBotMessageId = new ConcurrentHashMap<>();
 
     public TelegramBotService(TelegramClient telegramClient,
                               TelegramBotProperties botProperties,
                               TdLibClientService tdLibClientService,
                               SourceChannelRepository sourceChannelRepository,
                               DestinationChannelRepository destinationChannelRepository,
-                              PostTemplateRepository postTemplateRepository,
-                              OpenAiExtractorService openAiExtractorService,
-                              ObjectMapper objectMapper) {
+                              UserTemplateRepository userTemplateRepository,
+                              OpenAiExtractorService openAiExtractorService) {
         this.telegramClient = telegramClient;
         this.botProperties = botProperties;
         this.tdLibClientService = tdLibClientService;
         this.sourceChannelRepository = sourceChannelRepository;
         this.destinationChannelRepository = destinationChannelRepository;
-        this.postTemplateRepository = postTemplateRepository;
+        this.userTemplateRepository = userTemplateRepository;
         this.openAiExtractorService = openAiExtractorService;
-        this.objectMapper = objectMapper;
+    }
+
+    @PostConstruct
+    void setBotDescription() {
+        try {
+            String description = """
+                    Бот для агрегації постів з Telegram каналів.
+
+                    Автоматично відслідковує пости з обраних каналів, \
+                    витягує потрібні дані за допомогою AI, \
+                    очищує посилання від трекінгових кодів \
+                    та публікує у ваш канал за заданим шаблоном.
+
+                    Як почати:
+                    1. Підключіть Telegram акаунт
+                    2. Оберіть канали-джерела
+                    3. Вкажіть канал для публікації
+                    4. Задайте шаблон постів""";
+
+            String shortDescription = "Агрегація постів з Telegram каналів з AI обробкою та публікацією у ваш канал";
+
+            telegramClient.execute(SetMyDescription.builder()
+                    .description(description)
+                    .build());
+            telegramClient.execute(SetMyShortDescription.builder()
+                    .shortDescription(shortDescription)
+                    .build());
+            log.info("[BOT] Bot description set successfully");
+        } catch (Exception e) {
+            log.warn("[BOT] Failed to set bot description: {}", e.getMessage());
+        }
     }
 
     @Override
@@ -107,30 +141,30 @@ public class TelegramBotService implements SpringLongPollingBot, LongPollingSing
         text = text.trim();
         String chatId = message.getChatId().toString();
 
-        String action = pendingAction.remove(chatId);
-        if ("awaiting_template".equals(action)) {
-            saveTemplateText(chatId, text);
-            return;
-        }
-        if ("awaiting_result".equals(action)) {
-            saveResultText(chatId, message);
-            return;
-        }
-
         if ("/start".equals(text)) {
-            sendMainMenu(chatId);
+            pendingAction.remove(chatId);
+            handleStartCommand(chatId);
             return;
         }
 
-        Matcher inviteMatcher = INVITE_LINK.matcher(text);
-        if (inviteMatcher.find()) {
-            handleInviteLink(chatId, "https://t.me/" + inviteMatcher.group(1));
+        String action = pendingAction.remove(chatId);
+        if ("awaiting_phone".equals(action)) {
+            handlePhoneInput(chatId, text);
             return;
         }
-
-        Matcher publicMatcher = PUBLIC_LINK.matcher(text);
-        if (publicMatcher.find()) {
-            handlePublicLink(chatId, publicMatcher.group(1));
+        if ("awaiting_code".equals(action)) {
+            handleCodeInput(chatId, text);
+            return;
+        }
+        if ("awaiting_password".equals(action)) {
+            handlePasswordInput(chatId, text);
+            return;
+        }
+        if ("awaiting_template".equals(action)) {
+            String html = BotMessageConverter.toHtml(message);
+            boolean hasImage = message.hasPhoto();
+            saveGlobalTemplate(chatId, html, hasImage);
+            return;
         }
     }
 
@@ -144,338 +178,332 @@ public class TelegramBotService implements SpringLongPollingBot, LongPollingSing
                 .callbackQueryId(callback.getId())
                 .build());
 
-        if ("menu".equals(data)) {
-            sendMainMenu(chatId);
-        } else if (data.startsWith("my:")) {
-            int page = Integer.parseInt(data.substring(3));
-            showMyChannels(chatId, page);
-        } else if ("src".equals(data)) {
-            showSetSource(chatId, 0);
-        } else if (data.startsWith("sp:")) {
-            int page = Integer.parseInt(data.substring(3));
-            showSetSource(chatId, page);
-        } else if (data.startsWith("ss:")) {
-            long channelId = Long.parseLong(data.substring(3));
-            saveSource(chatId, channelId);
-        } else if ("rsrc".equals(data)) {
-            showRemoveSource(chatId, 0);
-        } else if (data.startsWith("rp:")) {
-            int page = Integer.parseInt(data.substring(3));
-            showRemoveSource(chatId, page);
-        } else if (data.startsWith("rs:")) {
-            long channelId = Long.parseLong(data.substring(3));
-            removeSource(chatId, channelId);
-        } else if ("dst".equals(data)) {
-            showSetDestination(chatId, 0);
-        } else if (data.startsWith("dp:")) {
-            int page = Integer.parseInt(data.substring(3));
-            showSetDestination(chatId, page);
-        } else if (data.startsWith("sd:")) {
-            long channelId = Long.parseLong(data.substring(3));
-            saveDestination(chatId, channelId);
-        } else if ("rd".equals(data)) {
-            removeDestination(chatId);
-        } else if ("tpl".equals(data)) {
-            pendingAction.put(chatId, "awaiting_template");
-            telegramClient.execute(SendMessage.builder()
+        pendingAction.remove(chatId);
+
+        if ("menu".equals(data) || "logout".equals(data)) {
+            if ("logout".equals(data)) {
+                handleLogout(chatId);
+            } else {
+                handleStartCommand(chatId);
+            }
+        } else if (tdLibClientService.getAuthState() != TdLibClientService.AuthState.READY) {
+            // No active session — redirect to phone input instead of handling the action
+            handleStartCommand(chatId);
+        } else if ("sources".equals(data)) {
+            showSourceSelection(chatId, 0);
+        } else if (data.startsWith("src_p:")) {
+            int page = Integer.parseInt(data.substring(6));
+            showSourceSelection(chatId, page);
+        } else if (data.startsWith("src_t:")) {
+            String[] parts = data.substring(6).split(":");
+            long channelId = Long.parseLong(parts[0]);
+            int page = Integer.parseInt(parts[1]);
+            toggleSource(chatId, channelId, page);
+        } else if ("destination".equals(data)) {
+            showDestinationSelection(chatId, 0);
+        } else if (data.startsWith("dst_p:")) {
+            int page = Integer.parseInt(data.substring(6));
+            showDestinationSelection(chatId, page);
+        } else if (data.startsWith("dst_s:")) {
+            long channelId = Long.parseLong(data.substring(6));
+            selectDestination(chatId, channelId);
+        } else if ("template".equals(data)) {
+            promptForTemplate(chatId);
+        }
+    }
+
+    // ---- Start / Main Menu ----
+
+    private void handleStartCommand(String chatId) throws Exception {
+        var state = tdLibClientService.getAuthState();
+        if (state == TdLibClientService.AuthState.READY) {
+            send(SendMessage.builder()
                     .chatId(chatId)
-                    .text("Send me the template post (example of source format):")
-                    .replyMarkup(backButton())
+                    .text("Оберіть дію:\n\n" + MENU_DESCRIPTION)
+                    .replyMarkup(mainMenuButtons())
                     .build());
-        } else if ("res".equals(data)) {
-            pendingAction.put(chatId, "awaiting_result");
-            telegramClient.execute(SendMessage.builder()
+        } else {
+            pendingAction.put(chatId, "awaiting_phone");
+            send(SendMessage.builder()
                     .chatId(chatId)
-                    .text("Send me a text instruction describing what to keep from the template and what to change:")
-                    .replyMarkup(backButton())
+                    .text("Для роботи бота, потрібно задати акаунт користувача, "
+                            + "щоб відслідковувати канали. Введіть будь ласка номер телефону")
                     .build());
         }
     }
 
-    // ---- Main Menu ----
-
-    private void sendMainMenu(String chatId) throws Exception {
-        telegramClient.execute(SendMessage.builder()
-                .chatId(chatId)
-                .text("Bot Aggregation \u2014 Main Menu")
-                .replyMarkup(mainMenuKeyboard())
-                .build());
-    }
-
-    private InlineKeyboardMarkup mainMenuKeyboard() {
+    private InlineKeyboardMarkup mainMenuButtons() {
         return new InlineKeyboardMarkup(List.of(
                 new InlineKeyboardRow(
-                        InlineKeyboardButton.builder().text("My Channels").callbackData("my:0").build()
+                        InlineKeyboardButton.builder().text("Джерело постів").callbackData("sources").build()
                 ),
                 new InlineKeyboardRow(
-                        InlineKeyboardButton.builder().text("Set Source").callbackData("src").build(),
-                        InlineKeyboardButton.builder().text("Remove Source").callbackData("rsrc").build()
+                        InlineKeyboardButton.builder().text("Канал для постів").callbackData("destination").build()
                 ),
                 new InlineKeyboardRow(
-                        InlineKeyboardButton.builder().text("Set Destination").callbackData("dst").build(),
-                        InlineKeyboardButton.builder().text("Remove Destination").callbackData("rd").build()
+                        InlineKeyboardButton.builder().text("Шаблон").callbackData("template").build()
                 ),
                 new InlineKeyboardRow(
-                        InlineKeyboardButton.builder().text("Template").callbackData("tpl").build(),
-                        InlineKeyboardButton.builder().text("Result").callbackData("res").build()
+                        InlineKeyboardButton.builder().text("Вийти з акаунта").callbackData("logout").build()
                 )
         ));
     }
 
-    // ---- My Channels (informational, paginated) ----
+    // ---- Auth flow ----
 
-    private void showMyChannels(String chatId, int page) throws Exception {
-        List<Map<String, Object>> channels = tdLibClientService.getSubscribedChannels();
-
-        if (channels.isEmpty()) {
-            sendText(chatId, "No subscribed channels found.");
-            return;
-        }
-
-        int totalPages = (channels.size() + PAGE_SIZE - 1) / PAGE_SIZE;
-        page = Math.max(0, Math.min(page, totalPages - 1));
-        int from = page * PAGE_SIZE;
-        int to = Math.min(from + PAGE_SIZE, channels.size());
-
-        var sb = new StringBuilder();
-        sb.append("Subscribed Channels (page ").append(page + 1).append("/").append(totalPages).append("):\n\n");
-        for (int i = from; i < to; i++) {
-            var ch = channels.get(i);
-            sb.append(ch.get("title")).append("\nID: ").append(ch.get("channelId")).append("\n\n");
-        }
-
-        List<InlineKeyboardRow> rows = new ArrayList<>();
-        var navRow = new InlineKeyboardRow();
-        if (page > 0) {
-            navRow.add(InlineKeyboardButton.builder().text("\u2B05 Prev").callbackData("my:" + (page - 1)).build());
-        }
-        if (page < totalPages - 1) {
-            navRow.add(InlineKeyboardButton.builder().text("Next \u27A1").callbackData("my:" + (page + 1)).build());
-        }
-        if (!navRow.isEmpty()) {
-            rows.add(navRow);
-        }
-        rows.add(new InlineKeyboardRow(
-                InlineKeyboardButton.builder().text("Back").callbackData("menu").build()
-        ));
-
-        telegramClient.execute(SendMessage.builder()
+    private void handleLogout(String chatId) throws Exception {
+        tdLibClientService.logOutAndShutdown();
+        pendingAction.put(chatId, "awaiting_phone");
+        send(SendMessage.builder()
                 .chatId(chatId)
-                .text(sb.toString())
-                .replyMarkup(new InlineKeyboardMarkup(rows))
+                .text("Сесію завершено. Введіть будь ласка номер телефону для нового підключення")
                 .build());
     }
 
-    // ---- Set Source (channel buttons, paginated) ----
+    private void handlePhoneInput(String chatId, String phone) throws Exception {
+        if (phone == null || phone.isBlank()) {
+            pendingAction.put(chatId, "awaiting_phone");
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Номер телефону не може бути порожнім. Введіть будь ласка номер телефону")
+                    .build());
+            return;
+        }
 
-    private void showSetSource(String chatId, int page) throws Exception {
+        phone = phone.trim();
+        if (!phone.startsWith("+")) {
+            phone = "+" + phone;
+        }
+
+        tdLibClientService.startWithPhone(phone);
+
+        pendingAction.put(chatId, "awaiting_code");
+        send(SendMessage.builder()
+                .chatId(chatId)
+                .text("Ви маєте отримати код від телеграму, "
+                        + "відправте його у форматі 1-2-3-4-5 (розділяйте кожну цифру знаком - ) для підтвердження входу.")
+                .build());
+    }
+
+    private void handleCodeInput(String chatId, String code) throws Exception {
+        String cleanCode = code.replaceAll("[^0-9]", "");
+        if (cleanCode.isEmpty()) {
+            pendingAction.put(chatId, "awaiting_code");
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Не знайдено цифр. Відправте код у форматі 1-2-3-4-5")
+                    .build());
+            return;
+        }
+
+        tdLibClientService.submitAuthCode(cleanCode);
+
+        var resultState = pollAuthState(10);
+
+        if (resultState == TdLibClientService.AuthState.READY) {
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Вітаю, ви успішно підключили акаунт до бота!\n\n" + MENU_DESCRIPTION)
+                    .replyMarkup(mainMenuButtons())
+                    .build());
+        } else if (resultState == TdLibClientService.AuthState.NEED_PASSWORD) {
+            pendingAction.put(chatId, "awaiting_password");
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Ваш акаунт має двофакторну автентифікацію. Введіть будь ласка ваш пароль.")
+                    .build());
+        } else {
+            pendingAction.put(chatId, "awaiting_code");
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Нажаль щось пішло не так, спробуйте ввести код ще раз")
+                    .build());
+        }
+    }
+
+    private void handlePasswordInput(String chatId, String password) throws Exception {
+        if (password == null || password.isBlank()) {
+            pendingAction.put(chatId, "awaiting_password");
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Пароль не може бути порожнім. Введіть будь ласка ваш пароль.")
+                    .build());
+            return;
+        }
+
+        tdLibClientService.submitAuthPassword(password.trim());
+
+        var resultState = pollAuthState(10);
+
+        if (resultState == TdLibClientService.AuthState.READY) {
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Вітаю, ви успішно підключили акаунт до бота!\n\n" + MENU_DESCRIPTION)
+                    .replyMarkup(mainMenuButtons())
+                    .build());
+        } else {
+            pendingAction.put(chatId, "awaiting_password");
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Нажаль щось пішло не так, спробуйте ввести пароль ще раз")
+                    .build());
+        }
+    }
+
+    private TdLibClientService.AuthState pollAuthState(int maxAttempts) {
+        var initialState = tdLibClientService.getAuthState();
+        for (int i = 0; i < maxAttempts; i++) {
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            var current = tdLibClientService.getAuthState();
+            if (current != initialState) {
+                return current;
+            }
+        }
+        return tdLibClientService.getAuthState();
+    }
+
+    // ---- Source selection (multi-select toggle) ----
+
+    private void showSourceSelection(String chatId, int page) throws Exception {
         List<Map<String, Object>> allChannels = tdLibClientService.getSubscribedChannels();
+
+        if (allChannels.isEmpty()) {
+            sendText(chatId, "Не знайдено жодного каналу, на який ви підписані.");
+            return;
+        }
 
         Set<Long> existingSourceIds = sourceChannelRepository.findAll().stream()
                 .map(SourceChannel::getChannelId)
                 .collect(Collectors.toSet());
 
-        List<Map<String, Object>> available = allChannels.stream()
-                .filter(ch -> !existingSourceIds.contains(((Number) ch.get("channelId")).longValue()))
-                .toList();
-
-        if (available.isEmpty()) {
-            sendText(chatId, "All subscribed channels are already added as sources.");
-            return;
-        }
-
-        int totalPages = (available.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+        int totalPages = (allChannels.size() + PAGE_SIZE - 1) / PAGE_SIZE;
         page = Math.max(0, Math.min(page, totalPages - 1));
         int from = page * PAGE_SIZE;
-        int to = Math.min(from + PAGE_SIZE, available.size());
+        int to = Math.min(from + PAGE_SIZE, allChannels.size());
 
         List<InlineKeyboardRow> rows = new ArrayList<>();
         for (int i = from; i < to; i++) {
-            var ch = available.get(i);
+            var ch = allChannels.get(i);
             String title = (String) ch.get("title");
             long chId = ((Number) ch.get("channelId")).longValue();
+            String label = existingSourceIds.contains(chId) ? "\u2705 " + title : title;
             rows.add(new InlineKeyboardRow(
-                    InlineKeyboardButton.builder().text(title).callbackData("ss:" + chId).build()
+                    InlineKeyboardButton.builder()
+                            .text(label)
+                            .callbackData("src_t:" + chId + ":" + page)
+                            .build()
             ));
         }
 
         var navRow = new InlineKeyboardRow();
         if (page > 0) {
-            navRow.add(InlineKeyboardButton.builder().text("\u2B05 Prev").callbackData("sp:" + (page - 1)).build());
+            navRow.add(InlineKeyboardButton.builder()
+                    .text("\u2B05 Назад").callbackData("src_p:" + (page - 1)).build());
         }
         if (page < totalPages - 1) {
-            navRow.add(InlineKeyboardButton.builder().text("Next \u27A1").callbackData("sp:" + (page + 1)).build());
+            navRow.add(InlineKeyboardButton.builder()
+                    .text("Далі \u27A1").callbackData("src_p:" + (page + 1)).build());
         }
         if (!navRow.isEmpty()) {
             rows.add(navRow);
         }
         rows.add(new InlineKeyboardRow(
-                InlineKeyboardButton.builder().text("Back").callbackData("menu").build()
+                InlineKeyboardButton.builder().text("Назад").callbackData("menu").build()
         ));
 
-        String headerText = "Select a channel to add as source";
-        if (totalPages > 1) {
-            headerText += " (page " + (page + 1) + "/" + totalPages + ")";
-        }
-        headerText += ":";
-
-        telegramClient.execute(SendMessage.builder()
-                .chatId(chatId)
-                .text(headerText)
-                .replyMarkup(new InlineKeyboardMarkup(rows))
-                .build());
+        editOrSend(chatId, "Оберіть канали, з яких будемо тягнути пости\n\n"
+                        + "Можна обрати декілька каналів, для відслідковування.\n\n"
+                        + "Це всі канали, на які підписаний ваш акаунт, "
+                        + "якщо хочете обрати інший канал, спочатку підпишіться користувачем на цей канал.",
+                new InlineKeyboardMarkup(rows));
     }
 
-    // ---- Save source (from button click) ----
+    private void toggleSource(String chatId, long channelId, int page) throws Exception {
+        var existing = sourceChannelRepository.findByChannelId(channelId);
 
-    private void saveSource(String chatId, long channelId) throws Exception {
-        if (sourceChannelRepository.existsByChannelId(channelId)) {
-            sendText(chatId, "This channel is already added as a source.");
+        if (existing.isPresent()) {
+            sourceChannelRepository.delete(existing.get());
+        } else {
+            String title = tdLibClientService.getSubscribedChannels().stream()
+                    .filter(ch -> ((Number) ch.get("channelId")).longValue() == channelId)
+                    .map(ch -> (String) ch.get("title"))
+                    .findFirst()
+                    .orElse(null);
+
+            var channel = new SourceChannel();
+            channel.setChannelId(channelId);
+            channel.setChannelName(title);
+            channel.setEnabled(true);
+            sourceChannelRepository.save(channel);
+        }
+
+        tdLibClientService.loadMonitoredChannels();
+        showSourceSelection(chatId, page);
+    }
+
+    // ---- Destination selection (single-select) ----
+
+    private void showDestinationSelection(String chatId, int page) throws Exception {
+        List<Map<String, Object>> allChannels = tdLibClientService.getSubscribedChannels();
+
+        if (allChannels.isEmpty()) {
+            sendText(chatId, "Не знайдено жодного каналу, на який ви підписані.");
             return;
         }
 
-        String title = tdLibClientService.getSubscribedChannels().stream()
-                .filter(ch -> ((Number) ch.get("channelId")).longValue() == channelId)
-                .map(ch -> (String) ch.get("title"))
-                .findFirst()
+        Long currentDestId = destinationChannelRepository.findCurrent()
+                .map(DestinationChannel::getChannelId)
                 .orElse(null);
 
-        var channel = new SourceChannel();
-        channel.setChannelId(channelId);
-        channel.setChannelName(title);
-        channel.setEnabled(true);
-        sourceChannelRepository.save(channel);
-
-        tdLibClientService.loadMonitoredChannels();
-
-        String confirmText = "Source added: " + (title != null ? title : String.valueOf(channelId))
-                + "\nID: " + channelId;
-
-        sendText(chatId, confirmText);
-    }
-
-    // ---- Remove Source (channel buttons, paginated) ----
-
-    private void showRemoveSource(String chatId, int page) throws Exception {
-        List<SourceChannel> sources = sourceChannelRepository.findAll();
-
-        if (sources.isEmpty()) {
-            sendText(chatId, "No source channels configured.");
-            return;
-        }
-
-        int totalPages = (sources.size() + PAGE_SIZE - 1) / PAGE_SIZE;
+        int totalPages = (allChannels.size() + PAGE_SIZE - 1) / PAGE_SIZE;
         page = Math.max(0, Math.min(page, totalPages - 1));
         int from = page * PAGE_SIZE;
-        int to = Math.min(from + PAGE_SIZE, sources.size());
+        int to = Math.min(from + PAGE_SIZE, allChannels.size());
 
         List<InlineKeyboardRow> rows = new ArrayList<>();
         for (int i = from; i < to; i++) {
-            var src = sources.get(i);
-            String label = src.getChannelName() != null ? src.getChannelName() : String.valueOf(src.getChannelId());
-            rows.add(new InlineKeyboardRow(
-                    InlineKeyboardButton.builder().text(label).callbackData("rs:" + src.getChannelId()).build()
-            ));
-        }
-
-        var navRow = new InlineKeyboardRow();
-        if (page > 0) {
-            navRow.add(InlineKeyboardButton.builder().text("\u2B05 Prev").callbackData("rp:" + (page - 1)).build());
-        }
-        if (page < totalPages - 1) {
-            navRow.add(InlineKeyboardButton.builder().text("Next \u27A1").callbackData("rp:" + (page + 1)).build());
-        }
-        if (!navRow.isEmpty()) {
-            rows.add(navRow);
-        }
-        rows.add(new InlineKeyboardRow(
-                InlineKeyboardButton.builder().text("Back").callbackData("menu").build()
-        ));
-
-        String headerText = "Select a source to remove";
-        if (totalPages > 1) {
-            headerText += " (page " + (page + 1) + "/" + totalPages + ")";
-        }
-        headerText += ":";
-
-        telegramClient.execute(SendMessage.builder()
-                .chatId(chatId)
-                .text(headerText)
-                .replyMarkup(new InlineKeyboardMarkup(rows))
-                .build());
-    }
-
-    private void removeSource(String chatId, long channelId) throws Exception {
-        var source = sourceChannelRepository.findByChannelId(channelId);
-
-        if (source.isEmpty()) {
-            sendText(chatId, "Source not found.");
-            return;
-        }
-
-        String name = source.get().getChannelName();
-        sourceChannelRepository.delete(source.get());
-        tdLibClientService.loadMonitoredChannels();
-
-        String confirmText = "Source removed: " + (name != null ? name : String.valueOf(channelId))
-                + "\nID: " + channelId;
-
-        sendText(chatId, confirmText);
-    }
-
-    // ---- Set Destination (channel buttons, paginated) ----
-
-    private void showSetDestination(String chatId, int page) throws Exception {
-        List<Map<String, Object>> channels = tdLibClientService.getSubscribedChannels();
-
-        if (channels.isEmpty()) {
-            sendText(chatId, "No subscribed channels found.");
-            return;
-        }
-
-        int totalPages = (channels.size() + PAGE_SIZE - 1) / PAGE_SIZE;
-        page = Math.max(0, Math.min(page, totalPages - 1));
-        int from = page * PAGE_SIZE;
-        int to = Math.min(from + PAGE_SIZE, channels.size());
-
-        List<InlineKeyboardRow> rows = new ArrayList<>();
-        for (int i = from; i < to; i++) {
-            var ch = channels.get(i);
+            var ch = allChannels.get(i);
             String title = (String) ch.get("title");
             long chId = ((Number) ch.get("channelId")).longValue();
+            String label = (currentDestId != null && currentDestId == chId)
+                    ? "\u2705 " + title : title;
             rows.add(new InlineKeyboardRow(
-                    InlineKeyboardButton.builder().text(title).callbackData("sd:" + chId).build()
+                    InlineKeyboardButton.builder()
+                            .text(label)
+                            .callbackData("dst_s:" + chId)
+                            .build()
             ));
         }
 
         var navRow = new InlineKeyboardRow();
         if (page > 0) {
-            navRow.add(InlineKeyboardButton.builder().text("\u2B05 Prev").callbackData("dp:" + (page - 1)).build());
+            navRow.add(InlineKeyboardButton.builder()
+                    .text("\u2B05 Назад").callbackData("dst_p:" + (page - 1)).build());
         }
         if (page < totalPages - 1) {
-            navRow.add(InlineKeyboardButton.builder().text("Next \u27A1").callbackData("dp:" + (page + 1)).build());
+            navRow.add(InlineKeyboardButton.builder()
+                    .text("Далі \u27A1").callbackData("dst_p:" + (page + 1)).build());
         }
         if (!navRow.isEmpty()) {
             rows.add(navRow);
         }
         rows.add(new InlineKeyboardRow(
-                InlineKeyboardButton.builder().text("Back").callbackData("menu").build()
+                InlineKeyboardButton.builder().text("Назад").callbackData("menu").build()
         ));
 
-        String headerText = "Select a channel as destination";
-        if (totalPages > 1) {
-            headerText += " (page " + (page + 1) + "/" + totalPages + ")";
-        }
-        headerText += ":";
-
-        telegramClient.execute(SendMessage.builder()
-                .chatId(chatId)
-                .text(headerText)
-                .replyMarkup(new InlineKeyboardMarkup(rows))
-                .build());
+        editOrSend(chatId, "Оберіть канал для публікації постів\n\n"
+                        + "Можна обрати лише один канал.\n\n"
+                        + "Це всі канали, на які підписаний ваш акаунт, "
+                        + "якщо хочете обрати інший канал, спочатку підпишіться користувачем на цей канал.",
+                new InlineKeyboardMarkup(rows));
     }
 
-    private void saveDestination(String chatId, long channelId) throws Exception {
+    private void selectDestination(String chatId, long channelId) throws Exception {
         var existing = destinationChannelRepository.findCurrent();
 
         DestinationChannel channel;
@@ -488,194 +516,149 @@ public class TelegramBotService implements SpringLongPollingBot, LongPollingSing
         }
         destinationChannelRepository.save(channel);
 
-        String title = tdLibClientService.getSubscribedChannels().stream()
-                .filter(ch -> ((Number) ch.get("channelId")).longValue() == channelId)
-                .map(ch -> (String) ch.get("title"))
-                .findFirst()
-                .orElse(null);
-
-        String confirmText = "Destination set: " + (title != null ? title : String.valueOf(channelId))
-                + "\nID: " + channelId;
-
-        sendText(chatId, confirmText);
+        // Re-show the destination list with the updated checkmark
+        showDestinationSelection(chatId, 0);
     }
 
-    // ---- Remove Destination ----
+    // ---- Template ----
 
-    private void removeDestination(String chatId) throws Exception {
-        var destination = destinationChannelRepository.findCurrent();
-
-        if (destination.isEmpty()) {
-            sendText(chatId, "No destination configured.");
-            return;
-        }
-
-        destinationChannelRepository.delete(destination.get());
-
-        sendText(chatId, "Destination removed.");
+    private void promptForTemplate(String chatId) throws Exception {
+        pendingAction.put(chatId, "awaiting_template");
+        send(SendMessage.builder()
+                .chatId(chatId)
+                .text("Відправте будь ласка шаблон, як ви хочете бачити пости "
+                        + "і з якими даними в своєму каналі")
+                .replyMarkup(backButton())
+                .build());
     }
 
-    // ---- Link handlers ----
-
-    private void handleInviteLink(String chatId, String link) throws Exception {
-        var info = tdLibClientService.checkChatInviteLink(link);
-        if (info == null) {
-            sendText(chatId, "Failed to resolve invite link.");
-            return;
-        }
-
-        if (info.chatId == 0) {
-            sendText(chatId, "You are not subscribed to this channel.");
-            return;
-        }
-
-        saveSourceFromLink(chatId, info.chatId, info.title);
-    }
-
-    private void handlePublicLink(String chatId, String username) throws Exception {
-        var chat = tdLibClientService.searchPublicChat(username);
-        if (chat == null) {
-            sendText(chatId, "Channel not found: @" + username);
-            return;
-        }
-
-        boolean subscribed = tdLibClientService.getSubscribedChannels().stream()
-                .anyMatch(ch -> ((Number) ch.get("channelId")).longValue() == chat.id);
-
-        if (!subscribed) {
-            sendText(chatId, "You are not subscribed to this channel.");
-            return;
-        }
-
-        saveSourceFromLink(chatId, chat.id, chat.title);
-    }
-
-    private void saveSourceFromLink(String chatId, long channelId, String title) throws Exception {
-        if (sourceChannelRepository.existsByChannelId(channelId)) {
-            sendText(chatId, "This channel is already added as a source.");
-            return;
-        }
-
-        var channel = new SourceChannel();
-        channel.setChannelId(channelId);
-        channel.setChannelName(title);
-        channel.setEnabled(true);
-        sourceChannelRepository.save(channel);
-
-        tdLibClientService.loadMonitoredChannels();
-
-        sendText(chatId, "Source added: " + (title != null ? title : String.valueOf(channelId))
-                + "\nID: " + channelId);
-    }
-
-    // ---- Template / Result handlers ----
-
-    private void saveTemplateText(String chatId, String text) throws Exception {
-        var existing = postTemplateRepository.findCurrent();
-        PostTemplate template;
-        if (existing.isPresent()) {
-            template = existing.get();
-        } else {
-            template = new PostTemplate();
-        }
-        template.setTemplateText(text);
-        postTemplateRepository.save(template);
-
-        sendText(chatId, "Template saved.");
-    }
-
-    private void saveResultText(String chatId, Message message) throws Exception {
-        String instruction = getMessageText(message);
-        if (instruction == null) return;
-        instruction = instruction.trim();
-
-        // Template must be set first
-        var existing = postTemplateRepository.findCurrent();
-        if (existing.isEmpty() || existing.get().getTemplateText() == null
-                || existing.get().getTemplateText().isBlank()) {
-            sendText(chatId, "Set the Template first (example of source post), then set the Result.");
-            return;
-        }
-
-        PostTemplate template = existing.get();
-
-        // Call AI: analyze template + instruction → fields + output_template
-        JsonNode analysis = openAiExtractorService.analyzeInstruction(
-                template.getTemplateText(), instruction);
+    private void saveGlobalTemplate(String chatId, String text, boolean hasImage) throws Exception {
+        var analysis = openAiExtractorService.analyzeTemplate(text);
         if (analysis == null) {
-            sendText(chatId, "Failed to analyze instruction. Please try again.");
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Не вдалось проаналізувати шаблон, спробуйте ще раз")
+                    .replyMarkup(mainMenuButtons())
+                    .build());
             return;
         }
 
-        JsonNode fieldsNode = analysis.path("fields");
-        JsonNode outputTemplateNode = analysis.path("output_template");
-
-        if (fieldsNode.isMissingNode() || !fieldsNode.isObject() || fieldsNode.isEmpty()) {
-            sendText(chatId, "No fields detected. Please try a different instruction.");
-            return;
-        }
-
-        String resultHtml = outputTemplateNode.asText("");
-        if (resultHtml.isBlank()) {
-            sendText(chatId, "Failed to generate output template. Please try again.");
-            return;
-        }
-
-        // Build fieldNames (label→lineNumber) and extract example values from template lines
-        var fieldLines = new java.util.LinkedHashMap<String, Integer>();
-        var fieldExamples = new java.util.LinkedHashMap<String, String>();
-        String[] templateLines = template.getTemplateText().split("\n", -1);
-
-        var fields = fieldsNode.fields();
-        while (fields.hasNext()) {
-            var entry = fields.next();
-            String label = entry.getKey();
-            int lineNum = entry.getValue().asInt(0);
-            if (lineNum > 0) {
-                fieldLines.put(label, lineNum);
-                if (lineNum <= templateLines.length) {
-                    fieldExamples.put(label, templateLines[lineNum - 1].trim());
-                }
+        // Build the template by replacing example values with {field_name} placeholders
+        // in the original HTML — this preserves all formatting
+        // Skip Telegram links — they are static parts of the template
+        String normalizedTemplate = text;
+        List<String> activeFields = new ArrayList<>();
+        for (var entry : analysis.examples().entrySet()) {
+            String fieldName = entry.getKey();
+            String exampleValue = entry.getValue();
+            if (exampleValue != null && !exampleValue.isBlank()
+                    && !exampleValue.contains("t.me/") && !exampleValue.contains("telegram.me/")) {
+                normalizedTemplate = normalizedTemplate.replace(exampleValue, "{" + fieldName + "}");
+                activeFields.add(fieldName);
             }
         }
 
-        if (fieldLines.isEmpty()) {
-            sendText(chatId, "No valid field mappings found. Please try again.");
+        String fieldsJson;
+        try {
+            fieldsJson = new ObjectMapper().writeValueAsString(activeFields);
+        } catch (Exception e) {
+            log.error("[BOT] Failed to serialize fields: {}", e.getMessage());
+            send(SendMessage.builder()
+                    .chatId(chatId)
+                    .text("Не вдалось проаналізувати шаблон, спробуйте ще раз")
+                    .replyMarkup(mainMenuButtons())
+                    .build());
             return;
         }
 
-        String fieldNamesJson = objectMapper.writeValueAsString(fieldLines);
-        String fieldExamplesJson = objectMapper.writeValueAsString(fieldExamples);
-
-        template.setResultText(instruction);
-        template.setResultHtml(resultHtml);
-        template.setFieldNames(fieldNamesJson);
-        template.setFieldExamples(fieldExamplesJson);
-        postTemplateRepository.save(template);
-
-        // Build readable summary
-        var summary = new StringBuilder("Result saved.\nFields:");
-        for (var entry : fieldLines.entrySet()) {
-            summary.append("\n  ").append(entry.getKey())
-                    .append(" ← line ").append(entry.getValue());
+        var existing = userTemplateRepository.findCurrent();
+        UserTemplate template;
+        if (existing.isPresent()) {
+            template = existing.get();
+        } else {
+            template = new UserTemplate();
         }
-        sendText(chatId, summary.toString());
+        template.setTemplateText(normalizedTemplate);
+        template.setFields(fieldsJson);
+        template.setHasImage(hasImage);
+        userTemplateRepository.save(template);
+
+        log.info("[BOT] Template saved: {}", normalizedTemplate);
+
+        send(SendMessage.builder()
+                .chatId(chatId)
+                .text("Шаблон збережено \u2705\n\n"
+                        + "Тепер коли в каналі для постів, будуть з'являтись нові пости, "
+                        + "з яких можна дістати всі дані під ваш шаблон. "
+                        + "Тоді в Джерелі постів, буде публікуватись пост з даними.")
+                .replyMarkup(mainMenuButtons())
+                .build());
     }
 
     // ---- Helpers ----
 
-    private void sendText(String chatId, String text) throws Exception {
-        telegramClient.execute(SendMessage.builder()
+    private Message send(SendMessage msg) throws Exception {
+        String chatId = msg.getChatId();
+        Integer previous = lastBotMessageId.get(chatId);
+        if (previous != null) {
+            deleteMessage(chatId, previous);
+        }
+        Message sent = (Message) telegramClient.execute(msg);
+        if (sent != null) {
+            lastBotMessageId.put(chatId, sent.getMessageId());
+        }
+        return sent;
+    }
+
+    /**
+     * Edits the existing bot message in place (text + buttons), avoiding the "flip" effect.
+     * Falls back to delete+send if there's no previous message or editing fails.
+     */
+    private void editOrSend(String chatId, String text, InlineKeyboardMarkup markup) throws Exception {
+        Integer previous = lastBotMessageId.get(chatId);
+        if (previous != null) {
+            try {
+                telegramClient.execute(EditMessageText.builder()
+                        .chatId(chatId)
+                        .messageId(previous)
+                        .text(text)
+                        .replyMarkup(markup)
+                        .build());
+                return;
+            } catch (Exception e) {
+                log.debug("[BOT] Failed to edit message, falling back to send: {}", e.getMessage());
+            }
+        }
+        send(SendMessage.builder()
                 .chatId(chatId)
                 .text(text)
-                .replyMarkup(mainMenuKeyboard())
+                .replyMarkup(markup)
+                .build());
+    }
+
+    private void deleteMessage(String chatId, int messageId) {
+        try {
+            telegramClient.execute(DeleteMessage.builder()
+                    .chatId(chatId)
+                    .messageId(messageId)
+                    .build());
+        } catch (Exception e) {
+            log.debug("[BOT] Failed to delete message {} in chat {}: {}", messageId, chatId, e.getMessage());
+        }
+    }
+
+    private void sendText(String chatId, String text) throws Exception {
+        send(SendMessage.builder()
+                .chatId(chatId)
+                .text(text)
+                .replyMarkup(mainMenuButtons())
                 .build());
     }
 
     private InlineKeyboardMarkup backButton() {
         return new InlineKeyboardMarkup(List.of(
                 new InlineKeyboardRow(
-                        InlineKeyboardButton.builder().text("Back").callbackData("menu").build()
+                        InlineKeyboardButton.builder().text("Назад").callbackData("menu").build()
                 )
         ));
     }

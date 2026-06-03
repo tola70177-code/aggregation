@@ -1,6 +1,5 @@
 package com.github.botaggregation.service;
 
-import com.github.botaggregation.dto.ExtractedProduct;
 import com.github.botaggregation.repository.DestinationChannelRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -28,11 +27,11 @@ public class TelegramPublisherService {
         this.destinationChannelRepository = destinationChannelRepository;
     }
 
-    public void publishHtml(String html, List<File> imageFiles) {
+    public boolean publishHtml(String html, List<File> imageFiles) {
         var destination = destinationChannelRepository.findCurrent();
         if (destination.isEmpty()) {
             log.warn("[PUBLISHER] No destination channel configured, skipping publish");
-            return;
+            return false;
         }
 
         String chatId = String.valueOf(destination.get().getChannelId());
@@ -41,7 +40,7 @@ public class TelegramPublisherService {
             if (imageFiles == null || imageFiles.isEmpty()) {
                 sendTextMessage(chatId, html);
             } else {
-                // Try to send image(s) with caption first
+                // Try to send image(s) with caption
                 try {
                     if (imageFiles.size() == 1) {
                         sendSinglePhoto(chatId, html, imageFiles.get(0));
@@ -49,43 +48,16 @@ public class TelegramPublisherService {
                         sendMediaGroup(chatId, html, imageFiles);
                     }
                 } catch (Exception captionError) {
-                    // Caption too long — fall back to image + separate text message
-                    log.debug("[PUBLISHER] Caption too long, splitting into image + text: {}", captionError.getMessage());
-                    if (imageFiles.size() == 1) {
-                        sendSinglePhoto(chatId, null, imageFiles.get(0));
-                    } else {
-                        sendMediaGroup(chatId, null, imageFiles);
-                    }
+                    // Caption too long — send text only, link preview will show an image
+                    log.warn("[PUBLISHER] Caption too long, sending text only: {}", captionError.getMessage());
                     sendTextMessage(chatId, html);
                 }
             }
             log.info("[PUBLISHER] Published HTML message");
+            return true;
         } catch (Exception e) {
             log.error("[PUBLISHER] Failed to publish HTML: {}", e.getMessage(), e);
-        }
-    }
-
-    public void publish(ExtractedProduct product, List<File> imageFiles) {
-        var destination = destinationChannelRepository.findCurrent();
-        if (destination.isEmpty()) {
-            log.warn("[PUBLISHER] No destination channel configured, skipping publish");
-            return;
-        }
-
-        String chatId = String.valueOf(destination.get().getChannelId());
-        String caption = formatCaption(product);
-
-        try {
-            if (imageFiles == null || imageFiles.isEmpty()) {
-                sendTextMessage(chatId, caption);
-            } else if (imageFiles.size() == 1) {
-                sendSinglePhoto(chatId, caption, imageFiles.get(0));
-            } else {
-                sendMediaGroup(chatId, caption, imageFiles);
-            }
-            log.info("[PUBLISHER] Published: {}", product.getTitle());
-        } catch (Exception e) {
-            log.error("[PUBLISHER] Failed to publish: {}", e.getMessage(), e);
+            return false;
         }
     }
 
@@ -94,7 +66,6 @@ public class TelegramPublisherService {
                 .chatId(chatId)
                 .text(text)
                 .parseMode("HTML")
-                .disableWebPagePreview(true)
                 .build();
         telegramClient.execute(message);
     }
@@ -125,24 +96,6 @@ public class TelegramPublisherService {
                 .medias(new ArrayList<>(media))
                 .build();
         telegramClient.execute(group);
-    }
-
-    private String formatCaption(ExtractedProduct product) {
-        var sb = new StringBuilder();
-
-        if (product.getTitle() != null && !product.getTitle().isBlank()) {
-            sb.append(product.getTitle());
-        }
-
-        if (product.getPrice() != null && !product.getPrice().isBlank()) {
-            sb.append("\n\n\uD83D\uDCB0 Price: ").append(product.getPrice());
-        }
-
-        if (product.getUrl() != null && !product.getUrl().isBlank()) {
-            sb.append("\n\n\uD83D\uDD17 ").append(product.getUrl());
-        }
-
-        return sb.toString();
     }
 
 }

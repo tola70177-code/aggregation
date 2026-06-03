@@ -5,11 +5,8 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
-import java.time.LocalDateTime;
-
 @Entity
-@Table(name = "processed_posts",
-        uniqueConstraints = @UniqueConstraint(columnNames = {"source_chat_id", "source_message_id"}))
+@Table(name = "processed_posts")
 @Getter
 @Setter
 @NoArgsConstructor
@@ -19,12 +16,12 @@ public class ProcessedPost {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @Column(name = "source_chat_id", nullable = false)
-    private Long sourceChatId;
+    @Column(name = "source_channel_id", nullable = false)
+    private Long sourceChannelId;
 
-    @Column(name = "source_message_id", nullable = false)
-    private Long sourceMessageId;
+    @Column(name = "content_link", length = 2048)
+    private String contentLink;
 
-    @Column(name = "processed_at", nullable = false)
-    private LocalDateTime processedAt = LocalDateTime.now();
+    @Column(name = "content_fields", columnDefinition = "TEXT")
+    private String contentFields;
 }

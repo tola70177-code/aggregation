@@ -2,11 +2,10 @@ package com.github.botaggregation.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.botaggregation.entity.PostTemplate;
 import com.github.botaggregation.entity.ProcessedPost;
-import com.github.botaggregation.repository.PostTemplateRepository;
+import com.github.botaggregation.entity.UserTemplate;
 import com.github.botaggregation.repository.ProcessedPostRepository;
-import com.github.botaggregation.util.EntityToHtmlConverter;
+import com.github.botaggregation.repository.UserTemplateRepository;
 import it.tdlight.jni.TdApi;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -14,14 +13,10 @@ import org.springframework.stereotype.Service;
 
 import java.io.File;
 import java.net.URI;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.regex.Pattern;
 
 @Service
@@ -29,29 +24,19 @@ import java.util.regex.Pattern;
 @RequiredArgsConstructor
 public class MessageProcessingService {
 
-    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\{\\{[^}]+}}");
-    private static final Pattern URL_PATTERN = Pattern.compile("https?://\\S+", Pattern.CASE_INSENSITIVE);
-
     private final ProcessedPostRepository processedPostRepository;
-    private final PostTemplateRepository postTemplateRepository;
+    private final UserTemplateRepository userTemplateRepository;
     private final OpenAiExtractorService openAiExtractorService;
-    private final UrlCleanerService urlCleanerService;
     private final TelegramPublisherService telegramPublisherService;
     private final ObjectMapper objectMapper;
+
+    record BuildResult(String content, Map<String, String> fields) {}
 
     public void processAlbum(List<TdApi.Message> albumMessages, TdLibClientService tdLibClient) {
         var firstMessage = albumMessages.get(0);
         long chatId = firstMessage.chatId;
 
-        // Step 1: Deduplication — skip if any message in the album was already processed
-        for (var msg : albumMessages) {
-            if (processedPostRepository.existsBySourceChatIdAndSourceMessageId(chatId, msg.id)) {
-                log.debug("[PROCESSING] Album already processed (msg {}/{}), skipping", chatId, msg.id);
-                return;
-            }
-        }
-
-        // Step 2: Extract formatted text from the first message that has a caption
+        // Step 1: Extract text from the first message that has a caption
         TdApi.FormattedText formattedText = null;
         for (var msg : albumMessages) {
             formattedText = extractFormattedText(msg);
@@ -64,35 +49,43 @@ public class MessageProcessingService {
 
         log.info("[PROCESSING] Processing album ({} messages) from chat {}", albumMessages.size(), chatId);
 
-        // Step 3: Download images from ALL album messages
+        // Step 2: Download images from ALL album messages (only if template expects images)
         List<File> imageFiles = new ArrayList<>();
-        for (var msg : albumMessages) {
-            imageFiles.addAll(downloadImages(msg, tdLibClient));
+        if (templateHasImage()) {
+            for (var msg : albumMessages) {
+                imageFiles.addAll(downloadImages(msg, tdLibClient));
+            }
         }
 
-        // Step 4: Template+result must be configured, otherwise block posting
-        Optional<PostTemplate> templateOpt = postTemplateRepository.findCurrent();
-        if (templateOpt.isEmpty() || !hasTemplateAndResult(templateOpt.get())) {
-            log.warn("[PROCESSING] Template and result not configured, blocking publish for album in chat {}", chatId);
+        // Step 3: Build content via field extraction + template substitution
+        BuildResult buildResult = buildContent(chatId, formattedText);
+        if (buildResult == null || buildResult.content() == null || buildResult.content().isBlank()) {
+            log.info("[PROCESSING] Build content returned empty for album in chat {}, skipping", chatId);
             return;
         }
 
-        String html = buildHtml(formattedText, templateOpt.get());
-        if (html == null || html.isBlank()) {
-            log.info("[PROCESSING] Build HTML returned empty for album in chat {}, skipping", chatId);
+        // Step 3b: Deduplication by link
+        String contentLink = buildResult.fields().get("link");
+        if (contentLink != null && !contentLink.isBlank() && !"null".equals(contentLink)) {
+            if (processedPostRepository.existsByContentLink(contentLink)) {
+                log.info("[PROCESSING] Duplicate link detected for album in chat {}: {}, skipping", chatId, contentLink);
+                return;
+            }
+        }
+
+        boolean published = telegramPublisherService.publishHtml(buildResult.content(), imageFiles);
+        if (!published) {
+            log.warn("[PROCESSING] Publish failed for album in chat {}, will retry next time", chatId);
             return;
         }
 
-        telegramPublisherService.publishHtml(html, imageFiles);
-
-        // Step 5: Mark all album messages as processed
-        for (var msg : albumMessages) {
-            var processedPost = new ProcessedPost();
-            processedPost.setSourceChatId(chatId);
-            processedPost.setSourceMessageId(msg.id);
-            processedPost.setProcessedAt(LocalDateTime.now());
-            processedPostRepository.save(processedPost);
-        }
+        // Step 4: Save processed post
+        String contentFieldsJson = serializeFields(buildResult.fields());
+        var processedPost = new ProcessedPost();
+        processedPost.setSourceChannelId(chatId);
+        processedPost.setContentLink(contentLink);
+        processedPost.setContentFields(contentFieldsJson);
+        processedPostRepository.save(processedPost);
 
         log.info("[PROCESSING] Successfully processed album ({} photos) from chat {}",
                 imageFiles.size(), chatId);
@@ -102,13 +95,7 @@ public class MessageProcessingService {
         long chatId = message.chatId;
         long messageId = message.id;
 
-        // Step 1: Deduplication
-        if (processedPostRepository.existsBySourceChatIdAndSourceMessageId(chatId, messageId)) {
-            log.debug("[PROCESSING] Duplicate message {}/{}, skipping", chatId, messageId);
-            return;
-        }
-
-        // Step 2: Extract formatted text
+        // Step 1: Extract text
         TdApi.FormattedText formattedText = extractFormattedText(message);
         if (formattedText == null || formattedText.text == null || formattedText.text.isBlank()) {
             log.debug("[PROCESSING] Empty text in message {}/{}, skipping", chatId, messageId);
@@ -117,126 +104,199 @@ public class MessageProcessingService {
 
         log.info("[PROCESSING] Processing message {}/{}", chatId, messageId);
 
-        // Step 3: Download images
-        List<File> imageFiles = downloadImages(message, tdLibClient);
+        // Step 2: Download images (only if template expects images)
+        List<File> imageFiles = templateHasImage()
+                ? downloadImages(message, tdLibClient)
+                : List.of();
 
-        // Step 4: Template+result must be configured, otherwise block posting
-        Optional<PostTemplate> templateOpt = postTemplateRepository.findCurrent();
-        if (templateOpt.isEmpty() || !hasTemplateAndResult(templateOpt.get())) {
-            log.warn("[PROCESSING] Template and result not configured, blocking publish for message {}/{}", chatId, messageId);
+        // Step 3: Build content via field extraction + template substitution
+        BuildResult buildResult = buildContent(chatId, formattedText);
+        if (buildResult == null || buildResult.content() == null || buildResult.content().isBlank()) {
+            log.info("[PROCESSING] Build content returned empty for message {}/{}, skipping", chatId, messageId);
             return;
         }
 
-        String html = buildHtml(formattedText, templateOpt.get());
-        if (html == null || html.isBlank()) {
-            log.info("[PROCESSING] Build HTML returned empty for message {}/{}, skipping", chatId, messageId);
+        // Step 3b: Deduplication by link
+        String contentLink = buildResult.fields().get("link");
+        if (contentLink != null && !contentLink.isBlank() && !"null".equals(contentLink)) {
+            if (processedPostRepository.existsByContentLink(contentLink)) {
+                log.info("[PROCESSING] Duplicate link detected for message {}/{}: {}, skipping", chatId, messageId, contentLink);
+                return;
+            }
+        }
+
+        boolean published = telegramPublisherService.publishHtml(buildResult.content(), imageFiles);
+        if (!published) {
+            log.warn("[PROCESSING] Publish failed for message {}/{}, will retry next time", chatId, messageId);
             return;
         }
 
-        telegramPublisherService.publishHtml(html, imageFiles);
-
-        // Step 5: Save processed post
+        // Step 4: Save processed post
+        String contentFieldsJson = serializeFields(buildResult.fields());
         var processedPost = new ProcessedPost();
-        processedPost.setSourceChatId(chatId);
-        processedPost.setSourceMessageId(messageId);
-        processedPost.setProcessedAt(LocalDateTime.now());
+        processedPost.setSourceChannelId(chatId);
+        processedPost.setContentLink(contentLink);
+        processedPost.setContentFields(contentFieldsJson);
         processedPostRepository.save(processedPost);
 
         log.info("[PROCESSING] Successfully processed message {}/{}", chatId, messageId);
     }
 
-    private String buildHtml(TdApi.FormattedText formattedText, PostTemplate template) {
+    BuildResult buildContent(long chatId, TdApi.FormattedText formattedText) {
+        // Global template is required
+        Optional<UserTemplate> templateOpt = userTemplateRepository.findCurrent();
+        if (templateOpt.isEmpty()) {
+            log.warn("[PROCESSING] No template configured, skipping chat {}", chatId);
+            return null;
+        }
+
+        UserTemplate userTemplate = templateOpt.get();
+
+        // Parse field names from fields (JSON array like ["title","price","link"])
+        String templateFieldsJson = userTemplate.getFields();
+        if (templateFieldsJson == null || templateFieldsJson.isBlank()) {
+            log.warn("[PROCESSING] No template fields configured, skipping chat {}", chatId);
+            return null;
+        }
+
+        List<String> fieldNames;
         try {
-            String messageText = formattedText.text;
+            fieldNames = objectMapper.readValue(templateFieldsJson, new TypeReference<>() {});
+        } catch (Exception e) {
+            log.error("[PROCESSING] Failed to parse template fields JSON: {}", e.getMessage());
+            return null;
+        }
 
-            // Read stored row mapping: label → template line number
-            Map<String, Integer> fieldLines = objectMapper.readValue(
-                    template.getFieldNames(), new TypeReference<LinkedHashMap<String, Integer>>() {});
+        // Get user's template (with {field_name} placeholders)
+        String template = userTemplate.getTemplateText();
+        if (template == null || template.isBlank()) {
+            log.warn("[PROCESSING] No template text configured, skipping chat {}", chatId);
+            return null;
+        }
 
-            // Read example values for URL params and fallback
-            Map<String, String> examples = Map.of();
-            if (template.getFieldExamples() != null && !template.getFieldExamples().isBlank()) {
-                examples = objectMapper.readValue(
-                        template.getFieldExamples(), new TypeReference<Map<String, String>>() {});
-            }
+        // Extract plain text with URLs from post
+        String postText = extractTextWithUrls(formattedText);
 
-            // Build compact field description: "product_name (line 1), price (line 3)"
-            var sb = new StringBuilder();
-            for (var entry : fieldLines.entrySet()) {
-                if (!sb.isEmpty()) sb.append(", ");
-                sb.append(entry.getKey()).append(" (line ").append(entry.getValue()).append(")");
-            }
+        // Call AI to extract field values
+        Map<String, String> fields = openAiExtractorService.extractFields(postText, fieldNames);
+        if (fields == null) {
+            log.info("[PROCESSING] extractFields returned null for chat {}, skipping", chatId);
+            return null;
+        }
 
-            // Step 2: Send post + field list to AI (short call — no template text)
-            Map<String, String> extracted = openAiExtractorService.extractFromPost(
-                    messageText, sb.toString());
-            if (extracted.isEmpty()) {
-                log.warn("[PROCESSING] Post extraction returned empty — structure may not match");
+        // Check all field values are non-null and non-empty
+        for (String fieldName : fieldNames) {
+            String value = fields.get(fieldName);
+            if (value == null || value.isBlank() || "null".equals(value)) {
+                log.info("[PROCESSING] REJECTED: missing field '{}' for chat {}", fieldName, chatId);
                 return null;
             }
+        }
 
-            // Step 3: Substitute into result HTML
-            String html = template.getResultHtml();
-            for (var entry : extracted.entrySet()) {
-                String placeholder = "{{" + entry.getKey() + "}}";
-                String value = entry.getValue();
-                if (value == null || value.isBlank()) continue;
+        // Clean URLs in field values before substitution (mutable copy in case source map is immutable)
+        Map<String, String> cleanedFields = new java.util.HashMap<>(fields);
+        for (Map.Entry<String, String> entry : cleanedFields.entrySet()) {
+            entry.setValue(cleanUrls(entry.getValue()));
+        }
 
-                if (URL_PATTERN.matcher(value).matches()) {
-                    // URL value — clean, append template params, substitute
-                    String cleaned = urlCleanerService.clean(value);
-                    String exampleUrl = examples.get(entry.getKey());
-                    if (exampleUrl != null && URL_PATTERN.matcher(exampleUrl).matches()) {
-                        cleaned = appendTemplateParams(cleaned, exampleUrl);
-                    }
-                    String hrefCheck = "href=\"" + placeholder + "\"";
-                    if (html.contains(hrefCheck)) {
-                        html = html.replace(hrefCheck, "href=\"" + cleaned + "\"");
-                    }
-                    html = html.replace(placeholder, EntityToHtmlConverter.escapeHtml(cleaned));
-                } else {
-                    // Text value — preserve formatting from source post
-                    String htmlValue = toHtmlWithFormatting(formattedText, value);
-                    html = html.replace(placeholder, htmlValue);
+        // Replace {field_name} placeholders in template
+        String result = template;
+        for (Map.Entry<String, String> entry : cleanedFields.entrySet()) {
+            result = result.replace("{" + entry.getKey() + "}", entry.getValue());
+        }
+
+        return new BuildResult(result, cleanedFields);
+    }
+
+    private static final Pattern URL_PATTERN = Pattern.compile("https?://\\S+");
+
+    private static final Pattern TRACKING_PARAMS = Pattern.compile(
+            "(?i)[?&](?:utm_\\w+|ref|tag|fbclid|gclid|sclid|dclid|msclkid"
+                    + "|mc_cid|mc_eid|yclid|_ga|_gl|affiliate_id|aff_id|partner|click_id)=[^&]*");
+
+    /**
+     * Cleans all URLs found in the value:
+     * - Strips affiliate redirect paths (e.g. s.click.aliexpress.com/e/_XXXXX → s.click.aliexpress.com/e/)
+     * - Removes tracking query parameters
+     */
+    String cleanUrls(String value) {
+        if (value == null) return null;
+        return URL_PATTERN.matcher(value).replaceAll(match -> cleanSingleUrl(match.group()));
+    }
+
+    private String cleanSingleUrl(String url) {
+        try {
+            URI uri = URI.create(url);
+            String host = uri.getHost();
+            if (host == null) return url;
+
+            // Strip affiliate redirect paths
+            // s.click.aliexpress.com/e/_XXXXX → s.click.aliexpress.com/e/
+            if (host.contains("click.aliexpress.com") && uri.getPath() != null) {
+                String path = uri.getPath();
+                if (path.startsWith("/e/")) {
+                    return uri.getScheme() + "://" + host + "/e/";
                 }
             }
 
-            // Fallback: fill remaining placeholders with example values
-            if (!examples.isEmpty()) {
-                for (var entry : examples.entrySet()) {
-                    String placeholder = "{{" + entry.getKey() + "}}";
-                    if (html.contains(placeholder) && entry.getValue() != null) {
-                        String hrefCheck = "href=\"" + placeholder + "\"";
-                        if (html.contains(hrefCheck)) {
-                            html = html.replace(hrefCheck, "href=\"" + entry.getValue() + "\"");
-                        }
-                        html = html.replace(placeholder, EntityToHtmlConverter.escapeHtml(entry.getValue()));
-                    }
-                }
+            // Strip tracking query parameters
+            String cleaned = url;
+            cleaned = TRACKING_PARAMS.matcher(cleaned).replaceAll("");
+            // Fix leftover '?' if all params were removed
+            if (cleaned.endsWith("?")) {
+                cleaned = cleaned.substring(0, cleaned.length() - 1);
             }
+            // Fix '?&' → '?' when first param was removed
+            cleaned = cleaned.replace("?&", "?");
 
-            html = PLACEHOLDER_PATTERN.matcher(html).replaceAll("");
-
-            return html;
+            return cleaned;
         } catch (Exception e) {
-            log.error("[PROCESSING] Failed to build HTML: {}", e.getMessage(), e);
+            return url;
+        }
+    }
+
+    private boolean templateHasImage() {
+        return userTemplateRepository.findCurrent()
+                .map(UserTemplate::isHasImage)
+                .orElse(false);
+    }
+
+    private String serializeFields(Map<String, String> fields) {
+        try {
+            return objectMapper.writeValueAsString(fields);
+        } catch (Exception e) {
+            log.warn("[PROCESSING] Failed to serialize fields: {}", e.getMessage());
             return null;
         }
     }
 
     /**
-     * Finds the plain-text value in the source post and converts it to HTML
-     * with any formatting entities (bold, italic, links, etc.) preserved.
+     * Extracts plain text from FormattedText, appending URLs from TextEntityTypeTextUrl
+     * entities that aren't visible in the text body.
      */
-    private String toHtmlWithFormatting(TdApi.FormattedText formattedText, String plainValue) {
-        if (formattedText.entities != null && formattedText.entities.length > 0) {
-            int idx = formattedText.text.indexOf(plainValue);
-            if (idx >= 0) {
-                return EntityToHtmlConverter.convertTdLibRange(
-                        formattedText.text, formattedText.entities, idx, idx + plainValue.length());
+    String extractTextWithUrls(TdApi.FormattedText formattedText) {
+        StringBuilder sb = new StringBuilder(formattedText.text);
+
+        if (formattedText.entities != null) {
+            List<String> hiddenUrls = new ArrayList<>();
+            for (var entity : formattedText.entities) {
+                if (entity.type instanceof TdApi.TextEntityTypeTextUrl textUrl) {
+                    String url = textUrl.url;
+                    // Check if this URL is already visible in the text
+                    if (!formattedText.text.contains(url)) {
+                        hiddenUrls.add(url);
+                    }
+                }
+            }
+            if (!hiddenUrls.isEmpty()) {
+                sb.append("\n");
+                for (String url : hiddenUrls) {
+                    sb.append("\n").append(url);
+                }
             }
         }
-        return EntityToHtmlConverter.escapeHtml(plainValue);
+
+        return sb.toString();
     }
 
     private TdApi.FormattedText extractFormattedText(TdApi.Message message) {
@@ -245,67 +305,16 @@ public class MessageProcessingService {
         if (content instanceof TdApi.MessageText textContent) {
             return textContent.text;
         }
-
         if (content instanceof TdApi.MessagePhoto photoContent) {
             return photoContent.caption;
         }
-
         if (content instanceof TdApi.MessageVideo videoContent) {
             return videoContent.caption;
         }
-
         if (content instanceof TdApi.MessageDocument docContent) {
             return docContent.caption;
         }
-
         return null;
-    }
-
-    /**
-     * Extracts query parameters from the template example URL and appends them
-     * to the cleaned source URL, so user's custom params (e.g. ?tag=test) are preserved.
-     */
-    private String appendTemplateParams(String cleanedUrl, String exampleUrl) {
-        try {
-            URI exampleUri = URI.create(exampleUrl.trim());
-            String exampleQuery = exampleUri.getRawQuery();
-            if (exampleQuery == null || exampleQuery.isEmpty()) {
-                return cleanedUrl;
-            }
-
-            URI cleanedUri = URI.create(cleanedUrl.trim());
-            String cleanedQuery = cleanedUri.getRawQuery();
-
-            // Collect existing param keys from cleaned URL to avoid duplicates
-            Set<String> existingKeys = new HashSet<>();
-            if (cleanedQuery != null) {
-                for (String param : cleanedQuery.split("&")) {
-                    existingKeys.add(param.split("=", 2)[0].toLowerCase());
-                }
-            }
-
-            // Append template params that are not already present
-            StringBuilder extra = new StringBuilder();
-            for (String param : exampleQuery.split("&")) {
-                String key = param.split("=", 2)[0].toLowerCase();
-                if (!existingKeys.contains(key)) {
-                    if (!extra.isEmpty()) extra.append("&");
-                    extra.append(param);
-                }
-            }
-
-            if (extra.isEmpty()) return cleanedUrl;
-
-            return cleanedUrl + (cleanedQuery != null ? "&" : "?") + extra;
-        } catch (Exception e) {
-            log.warn("[PROCESSING] Failed to append template params: {}", e.getMessage());
-            return cleanedUrl;
-        }
-    }
-
-    private boolean hasTemplateAndResult(PostTemplate template) {
-        return template.getResultHtml() != null && !template.getResultHtml().isBlank()
-                && template.getFieldNames() != null && !template.getFieldNames().isBlank();
     }
 
     private List<File> downloadImages(TdApi.Message message, TdLibClientService tdLibClient) {
@@ -313,7 +322,6 @@ public class MessageProcessingService {
         var content = message.content;
 
         if (content instanceof TdApi.MessagePhoto photoContent) {
-            // Get the largest photo size
             var sizes = photoContent.photo.sizes;
             if (sizes != null && sizes.length > 0) {
                 var largest = sizes[sizes.length - 1];

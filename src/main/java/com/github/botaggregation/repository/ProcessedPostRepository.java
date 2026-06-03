@@ -5,5 +5,5 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 public interface ProcessedPostRepository extends JpaRepository<ProcessedPost, Long> {
 
-    boolean existsBySourceChatIdAndSourceMessageId(Long sourceChatId, Long sourceMessageId);
+    boolean existsByContentLink(String contentLink);
 }

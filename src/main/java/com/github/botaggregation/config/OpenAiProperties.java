@@ -10,6 +10,6 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public class OpenAiProperties {
 
     private String apiKey;
-    private String model = "gpt-4o-mini";
+    private String model = "gpt-4.1";
     private String apiUrl = "https://api.openai.com/v1/chat/completions";
 }
