@@ -1,84 +1,67 @@
 # Telegram Channel Aggregator
 
-Monitors Telegram channels, extracts product info via OpenAI, cleans affiliate URLs, and republishes to a destination channel.
+## Структура проєкту
 
-## Quick Start
+Весь код знаходиться в папці:
 
-### 1. Start PostgreSQL
-
-```bash
-docker compose up -d postgres
+```
+src/main/java/com/github/botaggregation/
 ```
 
-### 2. Set environment variables
+Всередині є такі папки:
 
-```bash
-export TDLIB_API_ID=12345678
-export TDLIB_API_HASH=your_api_hash_here
-export OPENAI_API_KEY=sk-...
-export TELEGRAM_BOT_TOKEN=123456:ABC-...
-export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/bot_aggregation
-export SPRING_DATASOURCE_USERNAME=postgres
-export SPRING_DATASOURCE_PASSWORD=postgres
-```
+- **config** — налаштування системи (ключі доступу, підключення до сервісів).
+- **controller** — обробка запитів, які приходять ззовні.
+- **dto** — формати даних для цих запитів.
+- **entity** — опис того, що зберігається в базі даних.
+- **repository** — робота з базою даних (збереження, пошук, перевірка).
+- **service** — основна логіка: читання каналів, обробка повідомлень, публікація.
 
-Get `TDLIB_API_ID` and `TDLIB_API_HASH` at https://my.telegram.org. Get `TELEGRAM_BOT_TOKEN` from [@BotFather](https://t.me/BotFather). The bot must be an **admin** in the destination channel.
+### config
 
-### 3. Build and run
+- `AppConfig` — загальні налаштування роботи програми.
+- `SecurityConfig` — налаштування безпеки.
+- `TdLibProperties` — дані для входу в Telegram як користувач.
+- `OpenAiProperties` — дані для підключення до OpenAI (штучний інтелект).
+- `TelegramBotProperties` — токен Telegram-бота.
 
-```bash
-mvn clean package -DskipTests
-java -jar target/bot-aggregation-1.0.0.jar
-```
+### controller
 
-### 4. Set Telegram account
+- `AuthController` — авторизація в Telegram: перевірка стану, введення коду, введення пароля.
+- `ChannelController` — додавання, перегляд та видалення каналів-джерел.
+- `DestinationController` — вибір каналу, куди публікувати результат.
+- `GlobalExceptionHandler` — обробка помилок.
 
-```bash
-curl -X PUT http://localhost:8080/api/account \
-  -H "Content-Type: application/json" \
-  -d '{"phoneNumber": "+1234567890"}'
-```
+### dto
 
-### 5. Authenticate
+- `AddChannelRequest` — дані для додавання каналу-джерела.
+- `SetDestinationRequest` — дані для встановлення каналу призначення.
 
-Check auth state:
+### entity
 
-```bash
-curl http://localhost:8080/api/auth/status
-```
+- `SourceChannel` — канал, з якого читаються повідомлення (назва, увімкнений чи ні).
+- `DestinationChannel` — канал, куди публікується результат.
+- `ProcessedPost` — запис про вже оброблене повідомлення (щоб не дублювати).
+- `UserTemplate` — шаблон, за яким формується фінальний пост.
 
-When state is `NEED_CODE`, submit the code Telegram sent you:
+### repository
 
-```bash
-curl -X POST http://localhost:8080/api/auth/code \
-  -H "Content-Type: application/json" \
-  -d '{"code": "12345"}'
-```
+- `SourceChannelRepository` — знаходить активні канали-джерела.
+- `DestinationChannelRepository` — отримує поточний канал призначення.
+- `ProcessedPostRepository` — перевіряє, чи вже оброблено посилання.
+- `UserTemplateRepository` — отримує поточний шаблон.
 
-If 2FA is enabled (`NEED_PASSWORD`):
+### service
 
-```bash
-curl -X POST http://localhost:8080/api/auth/password \
-  -H "Content-Type: application/json" \
-  -d '{"password": "your_2fa_password"}'
-```
+- `TdLibClientService` — підключення до Telegram як користувач: вхід в акаунт, читання повідомлень, завантаження файлів.
+- `TelegramBotService` — Telegram-бот для керування системою: авторизація, вибір каналів, налаштування шаблону, вихід з акаунту.
+- `MessageProcessingService` — головний процес обробки: бере повідомлення, витягує текст та картинки, відправляє в ШІ, формує пост за шаблоном, прибирає рекламні мітки з посилань, перевіряє на дублікати, публікує.
+- `OpenAiExtractorService` — відправляє текст повідомлення в OpenAI, щоб витягнути структуровані дані (назва, ціна, посилання тощо).
+- `TelegramPublisherService` — публікує готовий пост з картинками в канал призначення.
+- `BotMessageConverter` — перетворює форматування повідомлень (жирний, курсив, посилання) у вигляд, зрозумілий для Telegram.
 
-Session persists in `./tdlib-data` — no re-auth needed on restart.
+## Що робить система
 
-### 6. Set destination channel
+Система автоматично слідкує за обраними Telegram-каналами. Коли в каналі з'являється нове повідомлення, система його читає, за допомогою штучного інтелекту витягує з тексту корисну інформацію (назву товару, ціну, посилання), підставляє ці дані в заздалегідь заданий шаблон, прибирає з посилань рекламні мітки та публікує готовий пост у ваш канал. Картинки також пересилаються, якщо це передбачено шаблоном. Дублікати не публікуються повторно.
 
-```bash
-curl -X PUT http://localhost:8080/api/destination \
-  -H "Content-Type: application/json" \
-  -d '{"channelId": -1001234567890}'
-```
-
-### 7. Add source channels
-
-```bash
-curl -X POST http://localhost:8080/api/channels \
-  -H "Content-Type: application/json" \
-  -d '{"channelId": -1009876543210}'
-```
-
-The UserBot account must be a member of the source channels. New messages are processed immediately.
+Все керування (вхід в акаунт, вибір каналів, шаблон) відбувається через Telegram-бота з кнопками.
